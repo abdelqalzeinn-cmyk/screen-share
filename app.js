@@ -84,16 +84,26 @@ $("connectBtn").onclick = () => {
 function startAsPhone() {
   show("phone");
   $("phCodeOut").textContent = code;
+  createPhonePeer();
+}
+
+function createPhonePeer() {
+  if (peer && !peer.destroyed) { try { peer.destroy(); } catch (_) {} }
   peer = new Peer(code + "-phone", { ...PEER_OPTS, ...SIGNAL });
 
   peer.on("open", () => setMsg("phCount", "listening…", "good"));
   peer.on("connection", (conn) => handlePcConnection(conn));
   peer.on("call", (call) => call.answer());   // safety: answer any stray call
+  peer.on("disconnected", () => {
+    setMsg("phCount", "reconnecting…", "good");
+    setTimeout(createPhonePeer, 1500);
+  });
   peer.on("error", (e) => {
     if (e.type === "unavailable-id") {
       setMsg("joinMsg", "This code already has a phone. Pick another code.", "bad");
       show("join");
-    } else console.warn("phone peer err", e.type);
+    } else if (e.type === "disconnected") { /* recovery handled by 'disconnected' event */ }
+    else console.warn("phone peer err", e.type);
   });
 }
 
@@ -205,24 +215,42 @@ function startAsPC() {
   show("pc");
   $("pcNameOut").textContent = pcName;
   $("pcCodeOut").textContent = code;
+  createPcPeer();
+  startCapture();
+}
+
+// Create (or recreate after a server drop) the PC's signaling peer.
+function createPcPeer() {
+  if (peer && !peer.destroyed) { try { peer.destroy(); } catch (_) {} }
+  pcConn = null;
   peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), { ...PEER_OPTS, ...SIGNAL });
 
   peer.on("open", () => {
     $("pcSlot").textContent = "online";
     wirePcPeer();
     setTimeout(connectToPhone, 600);   // let the phone register first (avoids silent offer-drop race)
-    startCapture();
   });
+
+  // Server WebSocket dropped (Render free tier spins down, network blip, etc).
+  // The peer is now dead for connect(); recreate it fresh instead of retrying
+  // on a corpse (which throws "Cannot connect to new Peer after disconnecting").
+  peer.on("disconnected", () => {
+    $("pcSlot").textContent = "reconnecting…";
+    $("pcSlot").style.background = "var(--pill)";
+    setMsg("joinMsg", "Lost signaling server — reconnecting…", "good");
+    setTimeout(createPcPeer, 1500);
+  });
+
   peer.on("error", (e) => {
-    if (e.type === "unavailable-id") { peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), { ...PEER_OPTS, ...SIGNAL }); }
+    if (e.type === "unavailable-id") { createPcPeer(); }
     else if (e.type === "peer-unavailable") {
       // PC tried to dial <code>-phone but the phone isn't registered yet.
-      // This is expected and transient — connectToPhone() retries every ~2s.
-      // Show a neutral "waiting" state, NOT a red error.
+      // Expected & transient — connectToPhone() retries every ~2.5s.
       $("pcSlot").textContent = "waiting for phone…";
       $("pcSlot").style.background = "var(--pill)";
       setMsg("joinMsg", "Phone not connected yet — retrying… (open the phone with the same code)", "good");
     }
+    else if (e.type === "disconnected") { /* recovery handled by 'disconnected' event */ }
     else {
       console.warn("pc peer err", e.type, e);
       $("pcSlot").textContent = "signal error";
@@ -241,13 +269,18 @@ function wirePcPeer() {
 }
 
 // Keep trying to connect to the phone until the data channel actually opens.
-// (Phone may register a beat after the PC; silent races need an open-poll, not
-//  just error/close retries.)
+// Only dials when the peer is OPEN — dialing a disconnected/dead peer throws
+// "Cannot connect to new Peer after disconnecting from server" and returns
+// undefined, which previously crashed at conn.on(...). The open/disconnected
+// handlers drive reconnection, so bailing here is safe.
 let connectTimer = null;
 function connectToPhone() {
-  if (!peer) return;
+  if (!peer || !peer.open || peer.disconnected || peer.destroyed) return;
   if (pcConn && pcConn.readyState === "open") return;   // already linked
-  const conn = peer.connect(code + "-phone");
+  let conn;
+  try { conn = peer.connect(code + "-phone"); }
+  catch (_) { retryConnect(); return; }
+  if (!conn) { retryConnect(); return; }
   conn.on("open", () => {
     pcConn = conn;
     conn.send({ type: "info", name: pcName });
@@ -261,7 +294,7 @@ function connectToPhone() {
 }
 function retryConnect() {
   if (connectTimer) return;
-  connectTimer = setTimeout(() => { connectTimer = null; connectToPhone(); }, 2000);
+  connectTimer = setTimeout(() => { connectTimer = null; connectToPhone(); }, 2500);
 }
 
 async function startCapture() {
