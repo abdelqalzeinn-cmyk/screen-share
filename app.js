@@ -15,7 +15,22 @@
  * (getDisplayMedia, 30-60fps). No media relay, so it's as fast as your LAN.
  */
 const $ = (id) => document.getElementById(id);
-const PEER_OPTS = { debug: 0 };
+// Signaling: if the user pasted a URL, derive host/port/path; else use PeerJS cloud.
+let SIGNAL = {};
+function parseSignal(url) {
+  if (!url) return {};
+  try {
+    const u = new URL(url);
+    let path = u.pathname || "/";
+    if (path === "/" || path === "") path = "/peerjs";   // PeerJS default
+    return {
+      host: u.hostname,
+      port: Number(u.port) || (u.protocol === "https:" ? 443 : 80),
+      path,
+      secure: u.protocol === "https:",
+    };
+  } catch { return {}; }
+}
 let peer = null;
 let mode = "pc";
 let code = "";
@@ -53,6 +68,7 @@ document.querySelectorAll(".mode").forEach(b => {
 $("connectBtn").onclick = () => {
   code = $("code").value.trim().toLowerCase().replace(/\s+/g, "-");
   if (!code) { setMsg("joinMsg", "Enter a room code"); return; }
+  SIGNAL = parseSignal($("signal").value.trim());
   if (mode === "pc") {
     pcName = $("pcName").value.trim() || "PC";
     startAsPC();
@@ -67,7 +83,7 @@ $("connectBtn").onclick = () => {
 function startAsPhone() {
   show("phone");
   $("phCodeOut").textContent = code;
-  peer = new Peer(code + "-phone", PEER_OPTS);
+  peer = new Peer(code + "-phone", { ...PEER_OPTS, ...SIGNAL });
 
   peer.on("open", () => setMsg("phCount", "listening…", "good"));
   peer.on("connection", (conn) => handlePcConnection(conn));
@@ -188,17 +204,22 @@ function startAsPC() {
   show("pc");
   $("pcNameOut").textContent = pcName;
   $("pcCodeOut").textContent = code;
-  peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), PEER_OPTS);
+  peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), { ...PEER_OPTS, ...SIGNAL });
 
   peer.on("open", () => {
     $("pcSlot").textContent = "online";
     wirePcPeer();
-    connectToPhone();          // <-- the missing piece: PC initiates
+    setTimeout(connectToPhone, 600);   // let the phone register first (avoids silent offer-drop race)
     startCapture();
   });
   peer.on("error", (e) => {
-    if (e.type === "unavailable-id") { peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), PEER_OPTS); }
-    else console.warn("pc peer err", e.type);
+    if (e.type === "unavailable-id") { peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), { ...PEER_OPTS, ...SIGNAL }); }
+    else {
+      console.warn("pc peer err", e.type, e);
+      $("pcSlot").textContent = "signal error";
+      $("pcSlot").style.background = "var(--bad)";
+      setMsg("joinMsg", "Peer error: " + e.type + (SIGNAL.host ? " (check signaling URL)" : " (public cloud busy?)"), "bad");
+    }
   });
 }
 
@@ -210,18 +231,28 @@ function wirePcPeer() {
   });
 }
 
-// retry until the phone comes online
+// Keep trying to connect to the phone until the data channel actually opens.
+// (Phone may register a beat after the PC; silent races need an open-poll, not
+//  just error/close retries.)
+let connectTimer = null;
 function connectToPhone() {
   if (!peer) return;
+  if (pcConn && pcConn.readyState === "open") return;   // already linked
   const conn = peer.connect(code + "-phone");
   conn.on("open", () => {
     pcConn = conn;
     conn.send({ type: "info", name: pcName });
-    if (localStream) conn.send({ type: "ready" });   // capture already done
+    if (localStream) conn.send({ type: "ready" });
   });
   conn.on("data", (d) => onPhoneData(conn, d));
-  conn.on("close", () => { pcConn = null; setTimeout(connectToPhone, 3000); });
-  conn.on("error", () => { setTimeout(connectToPhone, 3000); });
+  conn.on("close", () => { if (pcConn === conn) pcConn = null; retryConnect(); });
+  conn.on("error", () => retryConnect());
+  // open-poll: if it didn't open shortly, try again
+  setTimeout(() => { if (!pcConn || pcConn.readyState !== "open") retryConnect(); }, 2500);
+}
+function retryConnect() {
+  if (connectTimer) return;
+  connectTimer = setTimeout(() => { connectTimer = null; connectToPhone(); }, 2000);
 }
 
 async function startCapture() {
