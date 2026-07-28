@@ -215,6 +215,14 @@ function startAsPC() {
   });
   peer.on("error", (e) => {
     if (e.type === "unavailable-id") { peer = new Peer(code + "-pc-" + Math.random().toString(36).slice(2, 7), { ...PEER_OPTS, ...SIGNAL }); }
+    else if (e.type === "peer-unavailable") {
+      // PC tried to dial <code>-phone but the phone isn't registered yet.
+      // This is expected and transient — connectToPhone() retries every ~2s.
+      // Show a neutral "waiting" state, NOT a red error.
+      $("pcSlot").textContent = "waiting for phone…";
+      $("pcSlot").style.background = "var(--pill)";
+      setMsg("joinMsg", "Phone not connected yet — retrying… (open the phone with the same code)", "good");
+    }
     else {
       console.warn("pc peer err", e.type, e);
       $("pcSlot").textContent = "signal error";
