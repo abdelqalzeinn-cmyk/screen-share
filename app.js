@@ -15,6 +15,7 @@
  * (getDisplayMedia, 30-60fps). No media relay, so it's as fast as your LAN.
  */
 const $ = (id) => document.getElementById(id);
+const PEER_OPTS = { debug: 0 };
 // Signaling: if the user pasted a URL, derive host/port/path; else use PeerJS cloud.
 let SIGNAL = {};
 function parseSignal(url) {
